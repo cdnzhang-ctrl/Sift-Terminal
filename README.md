@@ -19,9 +19,12 @@ Disclaimer: This tool provides data-driven signals only, not investment advice.
 - Prints or logs values so you can monitor momentum over time
 
 ## Local Development
+
 If you want to run **Sift** on your own machine or inspect the source code:
+
 1. Prerequisites
 Ensure you have Python 3.9 or higher installed on your system.
+
 ```
 bash
 # Clone the repository
