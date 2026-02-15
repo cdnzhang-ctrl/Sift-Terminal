@@ -1,19 +1,15 @@
-# RSI Monitor
+# Sift: Technical Signal Tracker
 
 A terminal-based quantitative tool developed to identify market opportunities using **Pivot Point** structures and **RSI** momentum.
+Disclaimer: This tool provides data-driven signals only, not investment advice.
 
-### 🔗 [Click Here for Live Demo][1]
+### 🔗 [Click Here to Access][1]
 *(No Python or installation required. Access directly from your browser!)*
 ## Built With
 - Streamlit: Web Application Framework
 - yFinance: Market Data API
 - Pandas: Data Manipulation
 - Plotly: High-performance Interactive Charting
-
-## Author
-Cayden
-Freshman @ Georgetown University
-Focusing on Economics and Quantitative Finance
 
 ## What This Project Does
 
@@ -22,10 +18,13 @@ Focusing on Economics and Quantitative Finance
 - Generates advice such as `Buy`, `Sell`, or `Hold`
 - Prints or logs values so you can monitor momentum over time
 
-## Usage
+## Local Development
+
+If you want to run **Sift** on your own machine or inspect the source code:
 
 1. Prerequisites
 Ensure you have Python 3.9 or higher installed on your system.
+
 ```
 bash
 # Clone the repository
@@ -115,5 +114,10 @@ Use RSI with confirmation:
 - Support/resistance levels
 - Volume
 - Stop-loss and position sizing
+
+## Author
+Cayden Zhang 
+Freshman @ Georgetown University
+
 
 [1]:	https://sift-terminal-4p3sy2ex8swfxuhhqsbw7f.streamlit.app/
