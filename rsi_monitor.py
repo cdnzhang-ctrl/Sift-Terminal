@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Streamlit-based RSI + Pivot Points scanner."""
+"""Streamlit-based RSI Dual-Horizon scanner with professional signal/action UI."""
 
 from __future__ import annotations
 
@@ -18,6 +18,14 @@ PERIOD = "6mo"
 INTERVAL = "1d"
 RSI_WINDOW = 14
 MA_WINDOW = 50
+ATR_WINDOW = 14
+SHORT_WINDOW = 5
+LONG_WINDOW = 20
+
+FIB_R1_RATIO = 0.382
+FIB_R2_RATIO = 0.618
+BREAKOUT_ATR_MULT = 0.15
+SUPPORT_TEST_ATR_MULT = 0.10
 
 
 def compute_rsi(close: pd.Series, window: int = RSI_WINDOW) -> pd.Series:
@@ -30,6 +38,19 @@ def compute_rsi(close: pd.Series, window: int = RSI_WINDOW) -> pd.Series:
 
     rs = avg_gain / avg_loss.replace(0, pd.NA)
     return 100 - (100 / (1 + rs))
+
+
+def compute_atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int = ATR_WINDOW) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(window=window, min_periods=window).mean()
 
 
 def read_default_tickers(file_path: Path) -> List[str]:
@@ -63,20 +84,16 @@ def normalize_ohlc(frame: pd.DataFrame, ticker: str) -> pd.DataFrame:
         else:
             flat_cols = []
             for col in frame.columns:
-                if isinstance(col, tuple):
-                    flat_cols.append(col[0])
-                else:
-                    flat_cols.append(str(col))
+                flat_cols.append(col[0] if isinstance(col, tuple) else str(col))
             frame = frame.copy()
             frame.columns = flat_cols
 
-    required = ["Open", "High", "Low", "Close"]
+    required = ["Open", "High", "Low", "Close", "Volume"]
     if not all(col in frame.columns for col in required):
         return pd.DataFrame()
 
     out = frame[required].copy()
-    out = out.apply(pd.to_numeric, errors="coerce").dropna()
-    return out
+    return out.apply(pd.to_numeric, errors="coerce").dropna()
 
 
 @st.cache_data(show_spinner=False)
@@ -93,29 +110,129 @@ def fetch_one_ticker(ticker: str, period: str = PERIOD, interval: str = INTERVAL
     return normalize_ohlc(raw, ticker)
 
 
-def classify_signal(price_now: float, price_prev: float, support: float, resistance: float, rsi_now: float, rsi_prev: float) -> str:
-    rsi_rebound = rsi_prev < 30 <= rsi_now
-    support_reclaim = price_prev < support <= price_now
-    up_breakout = price_now > resistance
+def calculate_signals(ohlc: pd.DataFrame, horizon: str = "Short") -> Dict[str, float | str] | None:
+    if ohlc.empty or len(ohlc) < 2:
+        return None
 
-    if rsi_now < 30 and price_now < support:
-        return "Strong Buy / Oversold"
-    if rsi_now < 35:
-        return "Oversold Alert"
-    if support_reclaim or rsi_rebound:
-        return "Reversal Confirmed"
-    if rsi_now > 75 and price_now > resistance:
-        return "High Risk"
-    if up_breakout:
-        return "Breakout"
-    if rsi_now > 70:
-        return "Overbought Warning"
-    if 40 <= rsi_now <= 60 and not up_breakout:
-        return "Neutral / Waiting"
-    return "Reversal Watch"
+    frame = ohlc.copy()
+    frame["RSI"] = compute_rsi(frame["Close"], RSI_WINDOW)
+    frame["MA50"] = frame["Close"].rolling(window=MA_WINDOW, min_periods=MA_WINDOW).mean()
+    frame["ATR"] = compute_atr(frame["High"], frame["Low"], frame["Close"], ATR_WINDOW)
+
+    volume_avg20 = frame["Volume"].rolling(window=LONG_WINDOW, min_periods=LONG_WINDOW).mean()
+    frame["Volume_Ratio"] = frame["Volume"] / volume_avg20
+
+    latest = frame.iloc[-1]
+    prev = frame.iloc[-2]
+
+    rsi_now = latest["RSI"]
+    atr_now = latest["ATR"]
+    if pd.isna(rsi_now):
+        return None
+
+    price_now = float(latest["Close"])
+    atr_value = 0.0 if pd.isna(atr_now) else float(atr_now)
+    volume_ratio_raw = latest["Volume_Ratio"]
+    volume_ratio = 1.0 if pd.isna(volume_ratio_raw) else float(volume_ratio_raw)
+
+    prev_high = float(prev["High"])
+    prev_low = float(prev["Low"])
+    prev_close = float(prev["Close"])
+
+    pp = (prev_high + prev_low + prev_close) / 3
+    prev_range = prev_high - prev_low
+
+    fib_r1 = pp + FIB_R1_RATIO * prev_range
+    fib_r2 = pp + FIB_R2_RATIO * prev_range
+    fib_s1 = pp - FIB_R1_RATIO * prev_range
+    fib_s2 = pp - FIB_R2_RATIO * prev_range
+
+    low_5 = frame["Low"].rolling(window=SHORT_WINDOW, min_periods=SHORT_WINDOW).min().shift(1).iloc[-1]
+    high_5 = frame["High"].rolling(window=SHORT_WINDOW, min_periods=SHORT_WINDOW).max().shift(1).iloc[-1]
+    low_20 = frame["Low"].rolling(window=LONG_WINDOW, min_periods=LONG_WINDOW).min().shift(1).iloc[-1]
+    high_20 = frame["High"].rolling(window=LONG_WINDOW, min_periods=LONG_WINDOW).max().shift(1).iloc[-1]
+
+    low_5_value = fib_s1 if pd.isna(low_5) else float(low_5)
+    high_5_value = fib_r1 if pd.isna(high_5) else float(high_5)
+    low_20_value = fib_s2 if pd.isna(low_20) else float(low_20)
+    high_20_value = fib_r2 if pd.isna(high_20) else float(high_20)
+
+    if horizon == "Long":
+        resistance = max(fib_r2, high_20_value)
+        support = min(fib_s2, low_20_value)
+    else:
+        resistance = min(fib_r1, high_5_value)
+        support = max(fib_s1, low_5_value)
+
+    breakout_buffer = atr_value * BREAKOUT_ATR_MULT
+    breakout_line = resistance + breakout_buffer
+
+    if price_now <= support:
+        rr_ratio_display: float | str = "At Support"
+        rr_sort = 9999.0
+    elif price_now >= resistance:
+        rr_ratio_display = "Target Hit"
+        rr_sort = -1.0
+    else:
+        denominator = price_now - support
+        rr_ratio_value = (resistance - price_now) / denominator
+        rr_ratio_value = max(rr_ratio_value, 0.0)
+        rr_ratio_display = round(rr_ratio_value, 2)
+        rr_sort = rr_ratio_value
+
+    is_high_value = (
+        (
+            rr_ratio_display == "At Support"
+            or (isinstance(rr_ratio_display, (int, float)) and rr_ratio_display > 2.0)
+        )
+        and float(rsi_now) < 45
+    )
+
+    # Split Signal and Action (no emojis)
+    if price_now > breakout_line and volume_ratio > 1.2:
+        signal, action = "Strong Breakout", "Enter Long"
+    elif price_now > breakout_line and volume_ratio <= 1.2:
+        signal, action = "Weak Breakout", "Watch for Trap"
+    elif is_high_value:
+        signal, action = "High Value Opportunity", "Accumulate"
+    elif float(rsi_now) < 30:
+        signal, action = "Oversold", "Prepare to Buy"
+    elif float(rsi_now) > 70:
+        signal, action = "Overbought", "Take Profit"
+    elif price_now < support + (SUPPORT_TEST_ATR_MULT * atr_value):
+        signal, action = "Support Test", "Monitor Support"
+    else:
+        signal, action = "Neutral", "Wait"
+
+    return {
+        "Price": round(price_now, 2),
+        "Support": round(support, 2),
+        "Resistance": round(resistance, 2),
+        "RSI": round(float(rsi_now), 2),
+        "ATR": round(atr_value, 2),
+        "Volume_Ratio": round(volume_ratio, 2),
+        "RR_Ratio": rr_ratio_display,
+        "RR_Sort": round(rr_sort, 4),
+        "Signal": signal,
+        "Action": action,
+        "PP": round(pp, 2),
+        "Fib_R1": round(fib_r1, 2),
+        "Fib_R2": round(fib_r2, 2),
+        "Fib_S1": round(fib_s1, 2),
+        "Fib_S2": round(fib_s2, 2),
+        "High_5": round(high_5_value, 2),
+        "Low_5": round(low_5_value, 2),
+        "High_20": round(high_20_value, 2),
+        "Low_20": round(low_20_value, 2),
+        "Breakout_Buffer": round(breakout_buffer, 2),
+        "Breakout_Line": round(breakout_line, 2),
+    }
 
 
-def analyze_ticker(ticker: str) -> Tuple[Optional[Dict[str, float | str]], Optional[pd.DataFrame], Optional[str]]:
+def analyze_ticker(
+    ticker: str,
+    horizon: str = "Short",
+) -> Tuple[Optional[Dict[str, float | str]], Optional[pd.DataFrame], Optional[str]]:
     try:
         ohlc = fetch_one_ticker(ticker)
     except Exception as exc:  # noqa: BLE001
@@ -124,68 +241,80 @@ def analyze_ticker(ticker: str) -> Tuple[Optional[Dict[str, float | str]], Optio
     if ohlc.empty:
         return None, None, f"{ticker}: missing valid OHLC data"
 
-    if len(ohlc) < 2:
-        return None, None, f"{ticker}: missing yesterday OHLC data"
+    signals = calculate_signals(ohlc, horizon=horizon)
+    if signals is None:
+        return None, None, f"{ticker}: insufficient data for indicators"
 
     ohlc = ohlc.copy()
     ohlc["RSI"] = compute_rsi(ohlc["Close"], RSI_WINDOW)
     ohlc["MA50"] = ohlc["Close"].rolling(window=MA_WINDOW, min_periods=MA_WINDOW).mean()
 
-    rsi_now = ohlc["RSI"].iloc[-1]
-    rsi_prev = ohlc["RSI"].iloc[-2]
-    if pd.isna(rsi_now) or pd.isna(rsi_prev):
-        return None, None, f"{ticker}: RSI history insufficient"
-
-    latest = ohlc.iloc[-1]
-    prev = ohlc.iloc[-2]
-
-    price_now = float(latest["Close"])
-    price_prev = float(prev["Close"])
-
-    prev_high = float(prev["High"])
-    prev_low = float(prev["Low"])
-    prev_close = float(prev["Close"])
-
-    pp = (prev_high + prev_low + prev_close) / 3
-    support = (2 * pp) - prev_high
-    resistance = (2 * pp) - prev_low
-
-    signal = classify_signal(
-        price_now=price_now,
-        price_prev=price_prev,
-        support=support,
-        resistance=resistance,
-        rsi_now=float(rsi_now),
-        rsi_prev=float(rsi_prev),
-    )
-
     result = {
         "Ticker": ticker,
-        "Price": round(price_now, 2),
-        "Support": round(support, 2),
-        "Resistance": round(resistance, 2),
-        "RSI": round(float(rsi_now), 2),
-        "Signal": signal,
+        "Price": signals["Price"],
+        "Support": signals["Support"],
+        "Resistance": signals["Resistance"],
+        "RSI": signals["RSI"],
+        "RR_Ratio": signals["RR_Ratio"],
+        "RR_Sort": signals["RR_Sort"],
+        "Signal": signals["Signal"],
+        "Action": signals["Action"],
+        "ATR": signals["ATR"],
+        "Volume_Ratio": signals["Volume_Ratio"],
+        "PP": signals["PP"],
+        "Fib_R1": signals["Fib_R1"],
+        "Fib_R2": signals["Fib_R2"],
+        "Fib_S1": signals["Fib_S1"],
+        "Fib_S2": signals["Fib_S2"],
+        "High_5": signals["High_5"],
+        "Low_5": signals["Low_5"],
+        "High_20": signals["High_20"],
+        "Low_20": signals["Low_20"],
+        "Breakout_Buffer": signals["Breakout_Buffer"],
+        "Breakout_Line": signals["Breakout_Line"],
     }
 
     return result, ohlc, None
 
 
-def style_signal_column(df: pd.DataFrame) -> pd.io.formats.style.Styler:
-    def color_signal(value: str) -> str:
-        upper = value.upper()
-        if "BUY" in upper or "OVERSOLD" in upper or "REVERSAL" in upper:
-            return "background-color: #1f8b4c; color: white; font-weight: 600;"
-        if "RISK" in upper or "OVERBOUGHT" in upper:
-            return "background-color: #b22222; color: white; font-weight: 600;"
-        if "BREAKOUT" in upper:
-            return "background-color: #9c7a00; color: white; font-weight: 600;"
+def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+    def color_signal_action(value: str) -> str:
+        text = str(value).strip()
+
+        green = "rgba(0, 200, 83, 0.2)"
+        yellow = "rgba(255, 179, 0, 0.2)"
+        blue = "rgba(3, 169, 244, 0.2)"
+        red = "rgba(255, 82, 82, 0.2)"
+
+        if text in {"Strong Breakout", "High Value Opportunity", "Enter Long", "Accumulate"}:
+            return f"background-color: {green}; border: 1px solid {green}; font-weight: 700;"
+        if text in {"Weak Breakout", "Watch for Trap"}:
+            return f"background-color: {yellow}; border: 1px solid {yellow}; font-weight: 700;"
+        if text in {"Oversold", "Prepare to Buy", "Support Test", "Monitor Support"}:
+            return f"background-color: {blue}; border: 1px solid {blue}; font-weight: 700;"
+        if text in {"Overbought", "Take Profit"}:
+            return f"background-color: {red}; border: 1px solid {red}; font-weight: 700;"
         return ""
+
+    def format_rr(value: object) -> str:
+        if isinstance(value, (int, float)):
+            return f"{value:.2f}"
+        return str(value)
 
     return (
         df.style
-        .format({"Price": "{:.2f}", "Support": "{:.2f}", "Resistance": "{:.2f}", "RSI": "{:.2f}"})
-        .applymap(color_signal, subset=["Signal"])
+        .format(
+            {
+                "Price": "{:.2f}",
+                "Support": "{:.2f}",
+                "Resistance": "{:.2f}",
+                "RSI": "{:.2f}",
+                "RR_Ratio": format_rr,
+            }
+        )
+        .set_properties(subset=df.columns.tolist(), **{"text-align": "center"})
+        .set_properties(subset=["Signal", "Action"], **{"font-weight": "700"})
+        .applymap(color_signal_action, subset=["Signal", "Action"])
     )
 
 
@@ -213,13 +342,7 @@ def plot_ticker_detail(ticker: str, ohlc: pd.DataFrame, support: float, resistan
     )
 
     fig.add_trace(
-        go.Scatter(
-            x=ohlc.index,
-            y=ohlc["MA50"],
-            mode="lines",
-            line=dict(color="#1f77b4", width=2),
-            name="MA50",
-        ),
+        go.Scatter(x=ohlc.index, y=ohlc["MA50"], mode="lines", line=dict(color="#1f77b4", width=2), name="MA50"),
         row=1,
         col=1,
     )
@@ -249,13 +372,7 @@ def plot_ticker_detail(ticker: str, ohlc: pd.DataFrame, support: float, resistan
     )
 
     fig.add_trace(
-        go.Scatter(
-            x=ohlc.index,
-            y=ohlc["RSI"],
-            mode="lines",
-            line=dict(color="#ff7f0e", width=2),
-            name="RSI(14)",
-        ),
+        go.Scatter(x=ohlc.index, y=ohlc["RSI"], mode="lines", line=dict(color="#ff7f0e", width=2), name="RSI(14)"),
         row=2,
         col=1,
     )
@@ -280,8 +397,7 @@ def main() -> None:
 
     st.title("Sift Terminal")
     st.markdown(
-        "Professional RSI + Pivot scanner powered by Yahoo Finance. "
-        "Adjust tickers in the sidebar, run a scan, and inspect each symbol with interactive charts."
+        "Dual-Horizon RSI scanner with Fibonacci pivots, breakout filters, and action-oriented signal mapping."
     )
 
     script_dir = Path(__file__).resolve().parent
@@ -295,6 +411,14 @@ def main() -> None:
         height=260,
         help="You can add/remove tickers manually. Empty lines are ignored.",
     )
+
+    horizon_label = st.sidebar.radio(
+        "Time Horizon",
+        options=["Short-term (5D)", "Long-term (20D)"],
+        index=0,
+    )
+    horizon = "Short" if horizon_label == "Short-term (5D)" else "Long"
+
     run_scan = st.sidebar.button("Run Scan", type="primary")
 
     if "results_df" not in st.session_state:
@@ -303,6 +427,8 @@ def main() -> None:
         st.session_state.history_map = {}
     if "warnings" not in st.session_state:
         st.session_state.warnings = []
+    if "horizon" not in st.session_state:
+        st.session_state.horizon = horizon
 
     if run_scan:
         tickers = parse_tickers(tickers_text)
@@ -316,7 +442,7 @@ def main() -> None:
 
         with st.spinner("Running market scan..."):
             for ticker in tickers:
-                row, history, warn = analyze_ticker(ticker)
+                row, history, warn = analyze_ticker(ticker, horizon=horizon)
                 if warn:
                     warnings.append(warn)
                     continue
@@ -332,29 +458,35 @@ def main() -> None:
                     st.warning(warn)
             return
 
-        results_df = pd.DataFrame(rows).sort_values(by=["Signal", "Ticker"]).reset_index(drop=True)
+        results_df = pd.DataFrame(rows).sort_values(by=["RR_Sort", "Ticker"], ascending=[False, True]).reset_index(drop=True)
+
         st.session_state.results_df = results_df
         st.session_state.history_map = history_map
         st.session_state.warnings = warnings
+        st.session_state.horizon = horizon
 
     results_df = st.session_state.results_df
     history_map = st.session_state.history_map
     warnings = st.session_state.warnings
 
     if results_df is None:
-        st.info("Configure tickers and click 'Run Scan' in the sidebar.")
+        st.info("Configure tickers, choose time horizon, and click 'Run Scan' in the sidebar.")
         return
 
     oversold_count = int((results_df["RSI"] < 35).sum())
     overbought_count = int((results_df["RSI"] > 70).sum())
 
-    c1, c2, c3 = st.columns([1, 1, 1])
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
     c1.metric("Scanned Tickers", len(results_df))
     c2.metric("Oversold (<35)", oversold_count)
     c3.metric("Overbought (>70)", overbought_count)
+    c4.metric("Horizon", st.session_state.horizon)
 
     st.subheader("Scan Results")
-    st.dataframe(style_signal_column(results_df), use_container_width=True, hide_index=True)
+    display_df = results_df[["Ticker", "Price", "Support", "Resistance", "RSI", "RR_Ratio", "Signal", "Action"]].copy()
+    with st.container():
+        styled_df = style_results_table(display_df)
+        st.dataframe(styled_df, use_container_width=True, hide_index=True)
 
     if warnings:
         with st.expander("Skipped / Warning Details"):
@@ -367,13 +499,57 @@ def main() -> None:
     selected_row = results_df[results_df["Ticker"] == selected].iloc[0]
     selected_history = history_map[selected]
 
-    fig = plot_ticker_detail(
-        ticker=selected,
-        ohlc=selected_history,
-        support=float(selected_row["Support"]),
-        resistance=float(selected_row["Resistance"]),
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    tab_chart, tab_advanced = st.tabs(["Chart", "Advanced"])
+
+    with tab_chart:
+        fig = plot_ticker_detail(
+            ticker=selected,
+            ohlc=selected_history,
+            support=float(selected_row["Support"]),
+            resistance=float(selected_row["Resistance"]),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with tab_advanced:
+        with st.expander("Show advanced metrics and formulas", expanded=False):
+            metrics_col1, metrics_col2, metrics_col3 = st.columns([1, 1, 1])
+            metrics_col1.metric("ATR", f"{float(selected_row['ATR']):.2f}")
+            metrics_col2.metric("Volume Ratio", f"{float(selected_row['Volume_Ratio']):.2f}")
+            rr_text = selected_row["RR_Ratio"] if isinstance(selected_row["RR_Ratio"], str) else f"{float(selected_row['RR_Ratio']):.2f}"
+            metrics_col3.metric("RR Ratio", rr_text)
+
+            st.markdown("**Calculation Notes**")
+            st.markdown(
+                "- `PP = (H_prev + L_prev + C_prev) / 3`\n"
+                "- `Fib_R1 = PP + 0.382 * Range`, `Fib_R2 = PP + 0.618 * Range`\n"
+                "- `Fib_S1 = PP - 0.382 * Range`, `Fib_S2 = PP - 0.618 * Range`\n"
+                "- Short horizon: `Resistance = min(Fib_R1, High_5)`, `Support = max(Fib_S1, Low_5)`\n"
+                "- Long horizon: `Resistance = max(Fib_R2, High_20)`, `Support = min(Fib_S2, Low_20)`\n"
+                "- `Volume_Ratio = Volume / AvgVolume_20`\n"
+                "- `Breakout Buffer = 0.15 * ATR`\n"
+                "- `RR_Ratio = (Resistance - Price) / (Price - Support)` when Price is between Support and Resistance\n"
+                "- `At Support`: Price <= Support, indicating downside risk is compressed near support\n"
+                "- `Target Hit`: Price >= Resistance, indicating price has reached/exceeded the modeled target zone"
+            )
+
+            debug_df = pd.DataFrame(
+                [
+                    {
+                        "PP": selected_row["PP"],
+                        "Fib_R1": selected_row["Fib_R1"],
+                        "Fib_R2": selected_row["Fib_R2"],
+                        "Fib_S1": selected_row["Fib_S1"],
+                        "Fib_S2": selected_row["Fib_S2"],
+                        "High_5": selected_row["High_5"],
+                        "Low_5": selected_row["Low_5"],
+                        "High_20": selected_row["High_20"],
+                        "Low_20": selected_row["Low_20"],
+                        "Breakout_Buffer": selected_row["Breakout_Buffer"],
+                        "Breakout_Line": selected_row["Breakout_Line"],
+                    }
+                ]
+            )
+            st.dataframe(debug_df, use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
