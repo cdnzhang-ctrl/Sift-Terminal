@@ -116,4 +116,4 @@ Use RSI with confirmation:
 - Volume
 - Stop-loss and position sizing
 
-[1]:	%E5%8D%B3%E5%B0%86%E4%B8%8A%E7%BA%BF
+[1]:	https://sift-terminal-4p3sy2ex8swfxuhhqsbw7f.streamlit.app/
