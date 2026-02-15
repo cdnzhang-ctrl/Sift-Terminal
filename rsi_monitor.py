@@ -110,14 +110,37 @@ def fetch_one_ticker(ticker: str, period: str = PERIOD, interval: str = INTERVAL
     return normalize_ohlc(raw, ticker)
 
 
-def calculate_signals(ohlc: pd.DataFrame, horizon: str = "Short") -> Dict[str, float | str] | None:
+def calculate_signals(
+    ohlc: pd.DataFrame,
+    horizon: str = "Short",
+    ticker: str | None = None,
+) -> Dict[str, float | str] | None:
     if ohlc.empty or len(ohlc) < 2:
         return None
 
     frame = ohlc.copy()
+
+    # yfinance may occasionally return multi-level columns; flatten for stable field access.
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = frame.columns.get_level_values(0)
+
+    # Normalize column names to avoid whitespace/casing mismatches.
+    frame.columns = [str(col).strip().capitalize() for col in frame.columns]
+
+    required_cols = {"Open", "High", "Low", "Close", "Volume"}
+    if frame.empty or not required_cols.issubset(set(frame.columns)):
+        if ticker:
+            st.error(f"Missing required columns for {ticker}")
+        return None
+
     frame["RSI"] = compute_rsi(frame["Close"], RSI_WINDOW)
     frame["MA50"] = frame["Close"].rolling(window=MA_WINDOW, min_periods=MA_WINDOW).mean()
     frame["ATR"] = compute_atr(frame["High"], frame["Low"], frame["Close"], ATR_WINDOW)
+
+    if "Volume" not in frame.columns or frame.empty:
+        if ticker:
+            st.error(f"Missing required columns for {ticker}")
+        return None
 
     volume_avg20 = frame["Volume"].rolling(window=LONG_WINDOW, min_periods=LONG_WINDOW).mean()
     frame["Volume_Ratio"] = frame["Volume"] / volume_avg20
@@ -241,7 +264,7 @@ def analyze_ticker(
     if ohlc.empty:
         return None, None, f"{ticker}: missing valid OHLC data"
 
-    signals = calculate_signals(ohlc, horizon=horizon)
+    signals = calculate_signals(ohlc, horizon=horizon, ticker=ticker)
     if signals is None:
         return None, None, f"{ticker}: insufficient data for indicators"
 
