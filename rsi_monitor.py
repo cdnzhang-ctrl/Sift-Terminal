@@ -119,18 +119,51 @@ def calculate_signals(
         return None
 
     frame = ohlc.copy()
-
-    # yfinance may occasionally return multi-level columns; flatten for stable field access.
-    if isinstance(frame.columns, pd.MultiIndex):
-        frame.columns = frame.columns.get_level_values(0)
-
-    # Normalize column names to avoid whitespace/casing mismatches.
-    frame.columns = [str(col).strip().capitalize() for col in frame.columns]
-
     required_cols = {"Open", "High", "Low", "Close", "Volume"}
+
+    # Normalize candidate column names to canonical OHLCV names.
+    alias_map = {
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "volume": "Volume",
+    }
+
+    def canonical_name(col: object) -> str:
+        key = str(col).strip().replace("_", " ").lower()
+        key = " ".join(key.split())
+        return alias_map.get(key, str(col).strip())
+
+    # Handle yfinance MultiIndex variations robustly by trying both common levels.
+    if isinstance(frame.columns, pd.MultiIndex):
+        candidate_frames: list[pd.DataFrame] = []
+        for level in (0, -1):
+            try:
+                tmp = frame.copy()
+                tmp.columns = [canonical_name(c) for c in frame.columns.get_level_values(level)]
+                candidate_frames.append(tmp)
+            except Exception:
+                continue
+
+        resolved = None
+        for tmp in candidate_frames:
+            if required_cols.issubset(set(tmp.columns)):
+                resolved = tmp
+                break
+        if resolved is not None:
+            frame = resolved
+        else:
+            # last resort: flatten tuples then canonicalize
+            frame = frame.copy()
+            frame.columns = [canonical_name(c[0] if isinstance(c, tuple) and c else c) for c in frame.columns]
+    else:
+        frame.columns = [canonical_name(c) for c in frame.columns]
+
     if frame.empty or not required_cols.issubset(set(frame.columns)):
         if ticker:
-            st.error(f"Missing required columns for {ticker}")
+            got = ", ".join([str(c) for c in frame.columns]) if not frame.empty else "None"
+            st.error(f"Missing required columns for {ticker}. Found: {got}")
         return None
 
     frame["RSI"] = compute_rsi(frame["Close"], RSI_WINDOW)
@@ -139,7 +172,8 @@ def calculate_signals(
 
     if "Volume" not in frame.columns or frame.empty:
         if ticker:
-            st.error(f"Missing required columns for {ticker}")
+            got = ", ".join([str(c) for c in frame.columns]) if not frame.empty else "None"
+            st.error(f"Missing required columns for {ticker}. Found: {got}")
         return None
 
     volume_avg20 = frame["Volume"].rolling(window=LONG_WINDOW, min_periods=LONG_WINDOW).mean()
