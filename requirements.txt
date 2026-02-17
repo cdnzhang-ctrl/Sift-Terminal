@@ -3,3 +3,4 @@ pandas
 yfinance
 pandas_ta
 numpy
+plotly
